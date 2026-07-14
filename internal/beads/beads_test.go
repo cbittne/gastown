@@ -40,13 +40,25 @@ func TestListOptions(t *testing.T) {
 // TestListOptionsEphemeral verifies that Ephemeral flag is preserved.
 func TestListOptionsEphemeral(t *testing.T) {
 	opts := ListOptions{
-		Label:     "gt:merge-request",
-		Status:    "open",
-		Priority:  -1,
-		Ephemeral: true,
+		Label:            "gt:merge-request",
+		Status:           "open",
+		Priority:         -1,
+		Ephemeral:        true,
+		IncludeEphemeral: true,
 	}
 	if !opts.Ephemeral {
 		t.Error("Ephemeral should be true")
+	}
+	if !opts.IncludeEphemeral {
+		t.Error("IncludeEphemeral should be true")
+	}
+}
+
+func TestQuoteQueryValue(t *testing.T) {
+	got := "assignee=" + quoteBDQueryValue(`nginx_antman/witness "primary"`)
+	want := `assignee="nginx_antman/witness \"primary\""`
+	if got != want {
+		t.Fatalf("quoteBDQueryValue() = %q, want %q", got, want)
 	}
 }
 

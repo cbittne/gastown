@@ -706,6 +706,37 @@ func setupPatrolTestDB(t *testing.T) (string, *beads.Beads) {
 	return tmpDir, b
 }
 
+func markPatrolTestWorkspace(t *testing.T, townRoot string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatalf("create mayor marker: %v", err)
+	}
+	rigBeadsDir := filepath.Join(townRoot, "testrig", ".beads")
+	if err := os.MkdirAll(rigBeadsDir, 0o755); err != nil {
+		t.Fatalf("create rig beads redirect dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rigBeadsDir, "redirect"), []byte("../.beads\n"), 0o644); err != nil {
+		t.Fatalf("write rig beads redirect: %v", err)
+	}
+	if err := beads.WriteRoutes(filepath.Join(townRoot, ".beads"), []beads.Route{
+		{Prefix: "gt-", Path: "testrig"},
+	}); err != nil {
+		t.Fatalf("write test routes: %v", err)
+	}
+}
+
+func chdirPatrolTestWorkspace(t *testing.T, dir string) {
+	t.Helper()
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir %s: %v", dir, err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWD) })
+}
+
 // createHookedPatrol creates a bead with a patrol title and hooks it.
 // If withOpenChild is true, creates an open child bead to simulate an active patrol.
 func createHookedPatrol(t *testing.T, b *beads.Beads, molName, assignee string, withOpenChild bool) string {
@@ -736,6 +767,28 @@ func createHookedPatrol(t *testing.T, b *beads.Beads, molName, assignee string, 
 			t.Fatalf("create child: %v", err)
 		}
 	}
+	return root.ID
+}
+
+func createHookedEphemeralPatrol(t *testing.T, b *beads.Beads, molName, assignee string) string {
+	t.Helper()
+	root, err := b.Create(beads.CreateOptions{
+		Title:     molName,
+		Priority:  -1,
+		Ephemeral: true,
+	})
+	if err != nil {
+		t.Fatalf("create ephemeral patrol root: %v", err)
+	}
+
+	hooked := beads.StatusHooked
+	if err := b.Update(root.ID, beads.UpdateOptions{
+		Status:   &hooked,
+		Assignee: &assignee,
+	}); err != nil {
+		t.Fatalf("hook ephemeral patrol: %v", err)
+	}
+
 	return root.ID
 }
 
@@ -773,6 +826,112 @@ func TestFindActivePatrolHooked(t *testing.T) {
 	}
 	if issue.Status != beads.StatusHooked {
 		t.Errorf("patrol status = %q, want %q", issue.Status, beads.StatusHooked)
+	}
+}
+
+func TestFindActivePatrolHookedEphemeralSlashAssignee(t *testing.T) {
+	requireBd(t)
+	tmpDir, b := setupPatrolTestDB(t)
+
+	molName := "mol-test-patrol"
+	assignee := "testrig/witness"
+
+	rootID := createHookedEphemeralPatrol(t, b, molName, assignee)
+
+	cfg := PatrolConfig{
+		PatrolMolName: molName,
+		BeadsDir:      tmpDir,
+		Assignee:      assignee,
+		Beads:         b,
+	}
+
+	patrolID, _, found, findErr := findActivePatrol(cfg)
+	if findErr != nil {
+		t.Fatalf("findActivePatrol error: %v", findErr)
+	}
+	if !found {
+		t.Fatal("expected to find active ephemeral patrol, got not found")
+	}
+	if patrolID != rootID {
+		t.Errorf("patrolID = %q, want %q", patrolID, rootID)
+	}
+}
+
+func TestRunMoleculeStatusFindsHookedEphemeralSlashAssignee(t *testing.T) {
+	requireBd(t)
+	tmpDir, b := setupPatrolTestDB(t)
+	markPatrolTestWorkspace(t, tmpDir)
+	chdirPatrolTestWorkspace(t, tmpDir)
+	t.Setenv("GT_ROLE", "")
+	t.Setenv("GT_RIG", "")
+	t.Setenv("GT_POLECAT", "")
+
+	assignee := "testrig/witness"
+	rootID := createHookedEphemeralPatrol(t, b, "mol-test-patrol", assignee)
+
+	prevJSON := moleculeJSON
+	moleculeJSON = true
+	t.Cleanup(func() { moleculeJSON = prevJSON })
+
+	out := captureStdout(t, func() {
+		if err := runMoleculeStatus(nil, []string{assignee}); err != nil {
+			t.Fatalf("runMoleculeStatus: %v", err)
+		}
+	})
+
+	var status MoleculeStatusInfo
+	if err := json.Unmarshal([]byte(out), &status); err != nil {
+		t.Fatalf("parse molecule status output %q: %v", out, err)
+	}
+	if !status.HasWork {
+		t.Fatalf("expected molecule status to find hooked ephemeral patrol, got %+v", status)
+	}
+	if status.PinnedBead == nil {
+		t.Fatalf("expected pinned bead in molecule status, got %+v", status)
+	}
+	if status.PinnedBead.ID != rootID {
+		t.Errorf("pinned bead ID = %q, want %q", status.PinnedBead.ID, rootID)
+	}
+	if status.PinnedBead.Status != beads.StatusHooked {
+		t.Errorf("pinned bead status = %q, want %q", status.PinnedBead.Status, beads.StatusHooked)
+	}
+}
+
+func TestRunHookShowFindsHookedEphemeralSlashAssignee(t *testing.T) {
+	requireBd(t)
+	tmpDir, b := setupPatrolTestDB(t)
+	markPatrolTestWorkspace(t, tmpDir)
+	chdirPatrolTestWorkspace(t, tmpDir)
+
+	assignee := "testrig/witness"
+	rootID := createHookedEphemeralPatrol(t, b, "mol-test-patrol", assignee)
+
+	prevJSON := moleculeJSON
+	moleculeJSON = true
+	t.Cleanup(func() { moleculeJSON = prevJSON })
+
+	out := captureStdout(t, func() {
+		if err := runHookShow(nil, []string{assignee}); err != nil {
+			t.Fatalf("runHookShow: %v", err)
+		}
+	})
+
+	var hook struct {
+		Agent  string `json:"agent"`
+		BeadID string `json:"bead_id"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(out), &hook); err != nil {
+		t.Fatalf("parse hook show output %q: %v", out, err)
+	}
+	if hook.Agent != assignee {
+		t.Errorf("hook agent = %q, want %q", hook.Agent, assignee)
+	}
+	if hook.BeadID != rootID {
+		t.Errorf("hook bead ID = %q, want %q", hook.BeadID, rootID)
+	}
+	if hook.Status != beads.StatusHooked {
+		t.Errorf("hook status = %q, want %q", hook.Status, beads.StatusHooked)
 	}
 }
 

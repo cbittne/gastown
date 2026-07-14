@@ -447,6 +447,10 @@ type ListOptions struct {
 	Limit      int    // Max results (0 = unlimited, overrides bd default of 50)
 	Ephemeral  bool   // Search wisps table (ephemeral issues) instead of issues table
 	Rig        string // filter merge-request descriptions by rig before hydration
+	// IncludeEphemeral searches both normal issues and the wisps table.
+	// Use this for hook/patrol discovery where the authoritative hooked work
+	// may be a root-only wisp rather than a regular issue.
+	IncludeEphemeral bool
 }
 
 // CreateOptions specifies options for creating an issue.
@@ -898,6 +902,7 @@ func isSubprocessCrash(err error) bool {
 func (b *Beads) buildRunEnv() []string {
 	if b.isolated {
 		env := filterBeadsEnv(os.Environ())
+		env = append(env, "BD_DISABLE_METRICS=1")
 		if b.serverPort > 0 {
 			env = stripEnvPrefixes(env, "GT_DOLT_PORT=", "BEADS_DOLT_SERVER_PORT=", "BEADS_DOLT_PORT=", "BEADS_DOLT_AUTO_START=")
 			env = append(env, fmt.Sprintf("GT_DOLT_PORT=%d", b.serverPort))
@@ -921,6 +926,7 @@ func (b *Beads) buildRunEnv() []string {
 func (b *Beads) buildRoutingEnv() []string {
 	if b.isolated {
 		env := filterBeadsEnv(os.Environ())
+		env = append(env, "BD_DISABLE_METRICS=1")
 		if b.serverPort > 0 {
 			env = stripEnvPrefixes(env, "GT_DOLT_PORT=", "BEADS_DOLT_SERVER_PORT=", "BEADS_DOLT_PORT=", "BEADS_DOLT_AUTO_START=")
 			env = append(env, fmt.Sprintf("GT_DOLT_PORT=%d", b.serverPort))
@@ -1015,7 +1021,26 @@ func stripEnvPrefixes(environ []string, prefixes ...string) []string {
 // wisps table (where ephemeral issues live in beads v0.59+). Without this,
 // "bd list" only searches the issues table and misses wisps entirely.
 func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
-	if b.store != nil {
+	if opts.IncludeEphemeral {
+		normalOpts := opts
+		normalOpts.IncludeEphemeral = false
+		normalOpts.Ephemeral = false
+		normal, err := b.List(normalOpts)
+		if err != nil {
+			return nil, err
+		}
+
+		ephemeralOpts := opts
+		ephemeralOpts.IncludeEphemeral = false
+		ephemeralOpts.Ephemeral = true
+		ephemeral, err := b.List(ephemeralOpts)
+		if err != nil {
+			return nil, err
+		}
+		return mergeIssueLists(normal, ephemeral), nil
+	}
+
+	if b.store != nil && !opts.Ephemeral {
 		return b.storeList(opts)
 	}
 	if opts.Ephemeral {
@@ -1130,6 +1155,34 @@ func (b *Beads) ListIssueStatuses(statuses ...IssueStatus) ([]*Issue, error) {
 	return issues, nil
 }
 
+func mergeIssueLists(first, second []*Issue) []*Issue {
+	if len(first) == 0 {
+		return second
+	}
+	if len(second) == 0 {
+		return first
+	}
+	merged := make([]*Issue, 0, len(first)+len(second))
+	seen := make(map[string]struct{}, len(first)+len(second))
+	for _, issue := range first {
+		if issue == nil {
+			continue
+		}
+		merged = append(merged, issue)
+		seen[issue.ID] = struct{}{}
+	}
+	for _, issue := range second {
+		if issue == nil {
+			continue
+		}
+		if _, ok := seen[issue.ID]; ok {
+			continue
+		}
+		merged = append(merged, issue)
+	}
+	return merged
+}
+
 // listEphemeral searches the wisps table using "bd query" with ephemeral=true.
 // This is necessary because "bd list" only searches the issues table and does
 // not support an --ephemeral flag. Wisps (ephemeral issues like merge-request
@@ -1154,6 +1207,9 @@ func (b *Beads) listEphemeral(opts ListOptions) ([]*Issue, error) {
 	}
 	if opts.Assignee != "" {
 		clauses = append(clauses, "assignee="+quoteBDQueryValue(opts.Assignee))
+	}
+	if opts.NoAssignee {
+		clauses = append(clauses, "assignee="+quoteBDQueryValue("none"))
 	}
 
 	queryExpr := strings.Join(clauses, " AND ")
